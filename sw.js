@@ -1,5 +1,5 @@
 // Meu Estudo — Service Worker (Offline Support)
-const CACHE = 'meu-estudo-v1';
+const CACHE = 'meu-estudo-v2';
 
 const ASSETS = [
   './',
@@ -11,7 +11,6 @@ const ASSETS = [
   'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js',
 ];
 
-// Instala e faz cache de todos os assets
 self.addEventListener('install', e => {
   e.waitUntil(
     caches.open(CACHE).then(cache => {
@@ -24,7 +23,6 @@ self.addEventListener('install', e => {
   );
 });
 
-// Ativa e remove caches antigos
 self.addEventListener('activate', e => {
   e.waitUntil(
     caches.keys().then(keys =>
@@ -33,26 +31,31 @@ self.addEventListener('activate', e => {
   );
 });
 
-// Intercepta requests: cache-first para assets, network-first para API
 self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
 
-  // Requisições à API Anthropic: sempre vai para rede (precisa de internet)
-  if (url.hostname === 'api.anthropic.com') return;
+  // Só intercepta GET — POST passa direto (Firebase auth usa POST)
+  if (e.request.method !== 'GET') return;
 
-  // Para todos os outros: tenta cache primeiro, depois rede
+  // APIs dinâmicas sempre vão para a rede
+  if (url.hostname === 'api.anthropic.com') return;
+  if (url.hostname.includes('firestore.googleapis.com')) return;
+  if (url.hostname.includes('identitytoolkit.googleapis.com')) return;
+  if (url.hostname.includes('securetoken.googleapis.com')) return;
+
   e.respondWith(
     caches.match(e.request).then(cached => {
       if (cached) return cached;
       return fetch(e.request).then(response => {
-        // Cacheia respostas bem-sucedidas de fontes externas
-        if (response.ok && (url.hostname.includes('googleapis') || url.hostname.includes('cloudflare'))) {
+        if (response.ok &&
+            (url.hostname.includes('cloudflare') ||
+             url.hostname.includes('gstatic.com') ||
+             url.hostname.includes('fonts.googleapis.com'))) {
           const clone = response.clone();
           caches.open(CACHE).then(cache => cache.put(e.request, clone));
         }
         return response;
       }).catch(() => {
-        // Fallback offline: retorna index.html para navegação
         if (e.request.destination === 'document') {
           return caches.match('./index.html');
         }
