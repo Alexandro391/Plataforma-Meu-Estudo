@@ -2508,13 +2508,11 @@ function checkAlarms(now) {
 }
 
 // ══════════════════════════════════════════════
-// PROCESSAMENTO LOCAL — SEM IA EXTERNA
+// PROCESSAMENTO LOCAL — MOTOR NLP APRIMORADO
 // ══════════════════════════════════════════════
 
-// Palavras irrelevantes (stopwords PT-BR)
-const STOPWORDS = new Set(['a','o','e','é','de','do','da','dos','das','em','no','na','nos','nas','um','uma','uns','umas','para','por','com','que','se','não','mas','mais','como','ou','ao','aos','às','pelo','pela','pelos','pelas','seu','sua','seus','suas','este','esta','estes','estas','esse','essa','esses','essas','ele','ela','eles','elas','foi','são','ser','ter','tem','tinha','que','isso','isto','aqui','já','também','quando','onde','qual','quais','seus','sobre','entre','até','após','antes','durante','então','assim','cada','todo','toda','todos','todas','outro','outra','outros','outras','mesmo','muito','pouco','bem','assim','ainda','só','apenas','porém','contudo','entretanto','portanto','logo','pois','porque','embora','apenas']);
+const STOPWORDS = new Set(['a','o','e','é','de','do','da','dos','das','em','no','na','nos','nas','um','uma','uns','umas','para','por','com','que','se','não','mas','mais','como','ou','ao','aos','às','pelo','pela','pelos','pelas','seu','sua','seus','suas','este','esta','estes','estas','esse','essa','esses','essas','ele','ela','eles','elas','foi','são','ser','ter','tem','tinha','que','isso','isto','aqui','já','também','quando','onde','qual','quais','seus','sobre','entre','até','após','antes','durante','então','assim','cada','todo','toda','todos','todas','outro','outra','outros','outras','mesmo','muito','pouco','bem','assim','ainda','só','apenas','porém','contudo','entretanto','portanto','logo','pois','porque','embora','apenas','neste','nesta','deste','desta','nesse','nessa','desse','dessa','aquele','aquela','aqueles','aquelas','daquele','daquela','nisso','nisto','disso','disto','sendo','tendo','fazer','feito','feita','podem','pode','deve','devem','foram','eram','será','serão','está','estão','estava','estavam','tinha','tinham']);
 
-// Tokeniza e pondera palavras
 function tokenize(text) {
   return text.toLowerCase()
     .replace(/[^a-záéíóúàâêôãõüç\s]/g, ' ')
@@ -2522,163 +2520,407 @@ function tokenize(text) {
     .filter(w => w.length > 3 && !STOPWORDS.has(w));
 }
 
-// TF: frequência de termos
 function termFrequency(tokens) {
   const freq = {};
   tokens.forEach(t => freq[t] = (freq[t]||0) + 1);
   return freq;
 }
 
-// Pontua sentenças por relevância
-function scoreSentences(text) {
-  const sentences = text.match(/[^.!?]+[.!?]+/g) || text.split('\n').filter(s=>s.trim().length>20);
-  const allTokens = tokenize(text);
-  const freq = termFrequency(allTokens);
-  return sentences.map(s => {
-    const tokens = tokenize(s);
-    const score = tokens.reduce((acc, t) => acc + (freq[t]||0), 0) / (tokens.length||1);
-    return { text: s.trim(), score, tokens };
-  }).filter(s => s.text.length > 20);
+// TF-IDF simulado: penaliza termos muito comuns, premia termos médios
+function tfidfScore(tokens, freq, total) {
+  const uniqueTokens = [...new Set(tokens)];
+  return uniqueTokens.reduce((acc, t) => {
+    const tf = (freq[t]||0) / total;
+    const idf = Math.log(total / ((freq[t]||0) + 1)) + 1;
+    return acc + tf * idf;
+  }, 0);
 }
 
-// Extrai palavras-chave principais
+function scoreSentences(text) {
+  const raw = text.replace(/\n{2,}/g, ' ').replace(/\s+/g, ' ');
+  const sentences = raw.match(/[^.!?;]+[.!?;]+/g) || raw.split('\n').filter(s=>s.trim().length>30);
+  const allTokens = tokenize(text);
+  const freq = termFrequency(allTokens);
+  const total = allTokens.length || 1;
+  return sentences.map((s,pos) => {
+    const tokens = tokenize(s);
+    const score = tfidfScore(tokens, freq, total);
+    // Bonus para sentenças no início (tendem a ser definições)
+    const posBonus = pos < 3 ? 0.3 : pos < 6 ? 0.1 : 0;
+    // Bonus para sentenças de tamanho médio (nem curtas demais nem longas)
+    const lenBonus = s.length > 60 && s.length < 250 ? 0.2 : 0;
+    return { text: s.trim(), score: score + posBonus + lenBonus, tokens, pos };
+  }).filter(s => s.text.length > 30);
+}
+
 function extractKeywords(text, n=10) {
   const tokens = tokenize(text);
   const freq = termFrequency(tokens);
+  const total = tokens.length || 1;
+  // Usa TF-IDF para ranquear keywords, preferindo termos de frequência média
   return Object.entries(freq)
-    .sort((a,b) => b[1]-a[1])
+    .map(([w, f]) => ({ w, score: (f/total) * (Math.log(total/(f+1))+1) }))
+    .sort((a,b) => b.score - a.score)
     .slice(0, n)
-    .map(([w]) => w);
+    .map(x => x.w);
 }
 
-// Detecta tema principal (frase mais representativa)
+// Extrai frases-definição: contêm verbos de definição
+function extractDefinitions(text) {
+  const patterns = [
+    /([^.!?]+(?:é|são|foi|foram|consiste|define-se|refere-se|significa|representa|caracteriza)[^.!?]+[.!?])/gi,
+    /([^.!?]+(?:denominado|chamado|conhecido como|conceito de|termo)[^.!?]+[.!?])/gi,
+    /([^.!?]+(?:objetivo|finalidade|função|papel|importância)[^.!?]+[.!?])/gi,
+  ];
+  const defs = [];
+  patterns.forEach(p => {
+    const matches = text.match(p) || [];
+    matches.forEach(m => { if (m.length > 40 && m.length < 300) defs.push(m.trim()); });
+  });
+  return [...new Set(defs)];
+}
+
+// Extrai fatos com números/datas
+function extractFacts(text) {
+  const pattern = /[^.!?]*\b(\d{4}|\d+[%º°]|primeiro|segunda|terceiro|\bséculo\b)[^.!?]*[.!?]/gi;
+  const matches = text.match(pattern) || [];
+  return matches.filter(m => m.length > 40 && m.length < 300).map(m => m.trim());
+}
+
 function detectTema(text) {
+  const defs = extractDefinitions(text);
+  if (defs.length) return defs[0].substring(0,80);
   const scored = scoreSentences(text);
   if (!scored.length) return 'Conteúdo estudado';
   return scored.sort((a,b)=>b.score-a.score)[0].text.substring(0,80);
 }
 
-// Gera resumo em tópicos
+// ── RESUMO BULLET — melhorado com definições + fatos + tópicos ──
 function gerarResumoBullet(text) {
   const scored = scoreSentences(text);
-  const top = scored.sort((a,b)=>b.score-a.score).slice(0,8);
-  const icons = ['📌','🔑','📖','💡','🎯','📝','⚡','🔍'];
-  return top.map((s,i) => `${icons[i%icons.length]} ${s.text}`).join('\n\n');
+  const defs = extractDefinitions(text).slice(0,3);
+  const facts = extractFacts(text).slice(0,2);
+  const top = scored.sort((a,b)=>b.score-a.score)
+    .filter(s => !defs.includes(s.text) && !facts.includes(s.text))
+    .slice(0,5);
+
+  const keywords = extractKeywords(text, 8);
+  const paragrafos = text.split(/\n\n+/).filter(p=>p.trim().length>50);
+
+  let resultado = '';
+
+  // Bloco 1: Conceitos centrais (definições detectadas)
+  if (defs.length) {
+    resultado += '━━━ CONCEITOS CENTRAIS ━━━\n';
+    defs.forEach(d => resultado += `📌 ${d}\n\n`);
+  }
+
+  // Bloco 2: Pontos principais (frases mais relevantes)
+  resultado += '━━━ PONTOS PRINCIPAIS ━━━\n';
+  const icons = ['🔑','📖','💡','🎯','📝','⚡'];
+  top.forEach((s,i) => resultado += `${icons[i%icons.length]} ${s.text}\n\n`);
+
+  // Bloco 3: Dados e fatos
+  if (facts.length) {
+    resultado += '━━━ DATAS E DADOS ━━━\n';
+    facts.forEach(f => resultado += `📅 ${f}\n\n`);
+  }
+
+  // Bloco 4: Termos-chave
+  resultado += `━━━ TERMOS-CHAVE ━━━\n🗝️ ${keywords.join(' • ')}`;
+
+  return resultado;
 }
 
-// Gera resumo Cornell
+// ── CORNELL melhorado ──
 function gerarResumoCornell(text) {
   const scored = scoreSentences(text);
-  const top = scored.sort((a,b)=>b.score-a.score);
-  const keywords = extractKeywords(text, 8);
-  const notas = top.slice(0,5).map(s=>`• ${s.text}`).join('\n');
-  const sumario = top.slice(0,2).map(s=>s.text).join(' ');
-  return `═══ NOTAS ═══\n${notas}\n\n═══ PALAVRAS-CHAVE ═══\n${keywords.map(k=>`• ${k}`).join('\n')}\n\n═══ SUMÁRIO ═══\n${sumario}`;
+  const sorted = scored.sort((a,b)=>b.score-a.score);
+  const defs = extractDefinitions(text).slice(0,3);
+  const facts = extractFacts(text).slice(0,2);
+  const keywords = extractKeywords(text, 10);
+
+  const notas = [...defs, ...sorted.slice(0,4).map(s=>s.text)]
+    .slice(0,6).map(s=>`  • ${s}`).join('\n');
+
+  const perguntasChave = keywords.slice(0,5).map(k =>
+    `  ❓ O que o texto explica sobre "${k}"?`
+  ).join('\n');
+
+  const sumario = sorted.slice(0,3).map(s=>s.text).join(' ').substring(0,300);
+
+  return `╔══════════════════════════════╗
+║       MÉTODO CORNELL         ║
+╚══════════════════════════════╝
+
+┌─ ANOTAÇÕES ──────────────────
+${notas}
+${facts.length ? '\n  📅 ' + facts.join('\n  📅 ') : ''}
+
+├─ PERGUNTAS-CHAVE ────────────
+${perguntasChave}
+
+└─ TERMOS IMPORTANTES ─────────
+  🗝️ ${keywords.join(' • ')}
+
+━━━ SUMÁRIO ━━━━━━━━━━━━━━━━━━
+${sumario}`;
 }
 
-// Gera resumo pirâmide invertida
+// ── PIRÂMIDE melhorada ──
 function gerarResumoPiramide(text) {
   const scored = scoreSentences(text);
-  const top = scored.sort((a,b)=>b.score-a.score);
-  return `🔺 CONCEITO CENTRAL\n${top[0]?.text||''}\n\n🔸 INFORMAÇÕES PRINCIPAIS\n${top.slice(1,4).map(s=>`• ${s.text}`).join('\n')}\n\n🔹 CONTEXTO E DETALHES\n${top.slice(4,7).map(s=>`• ${s.text}`).join('\n')}`;
+  const sorted = scored.sort((a,b)=>b.score-a.score);
+  const defs = extractDefinitions(text);
+  const facts = extractFacts(text);
+  const keywords = extractKeywords(text, 6);
+
+  const central = defs[0] || sorted[0]?.text || '';
+  const principais = [...(defs.slice(1,3)), ...sorted.slice(1,4).map(s=>s.text)].slice(0,4);
+  const detalhes = [...facts, ...sorted.slice(4,7).map(s=>s.text)].slice(0,4);
+
+  return `🔺 CONCEITO / IDEIA CENTRAL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+${central}
+
+🔸 INFORMAÇÕES PRINCIPAIS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+${principais.map(s=>`• ${s}`).join('\n')}
+
+🔹 DETALHES E CONTEXTO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+${detalhes.map(s=>`• ${s}`).join('\n')}
+
+🗝️ PALAVRAS-CHAVE: ${keywords.join(' • ')}`;
 }
 
-// Gera mapa mental textual
+// ── MAPA MENTAL melhorado ──
 function gerarMapaMental(text) {
-  const keywords = extractKeywords(text, 12);
-  const scored = scoreSentences(text);
-  const tema = scored.sort((a,b)=>b.score-a.score)[0]?.text.substring(0,50)||'Tema Principal';
-  const ramos = keywords.slice(0,5);
-  let mapa = `🗺️ ${tema.toUpperCase()}\n`;
-  ramos.forEach((r,i) => {
-    mapa += `\n  ├─ ${r.charAt(0).toUpperCase()+r.slice(1)}\n`;
-    keywords.slice(5+i*1, 6+i*1).forEach(sub => {
-      mapa += `  │   └─ ${sub}\n`;
+  const keywords = extractKeywords(text, 16);
+  const defs = extractDefinitions(text);
+  const facts = extractFacts(text);
+  const scored = scoreSentences(text).sort((a,b)=>b.score-a.score);
+  const tema = (defs[0] || scored[0]?.text || 'Tema Principal').substring(0,60);
+  const ramos = keywords.slice(0,6);
+
+  let mapa = `🗺️  ${tema.toUpperCase()}\n${'═'.repeat(Math.min(tema.length+4,60))}\n`;
+  ramos.forEach((r, i) => {
+    const isLast = i === ramos.length - 1;
+    mapa += `\n  ${isLast?'└':'├'}─ 🔹 ${r.charAt(0).toUpperCase()+r.slice(1)}\n`;
+    // Sub-ramos: keywords relacionadas e fatos
+    const subs = keywords.slice(6).slice(i*1, i*1+2);
+    subs.forEach((s, j) => {
+      mapa += `  ${isLast?' ':'│'}   ${j===subs.length-1?'└':'├'}─ ${s}\n`;
     });
+    // Adiciona fato relacionado se houver
+    if (facts[i]) {
+      mapa += `  ${isLast?' ':'│'}   └─ 📅 ${facts[i].substring(0,60)}...\n`;
+    }
   });
   return mapa;
 }
 
-// Gera flashcards automaticamente
+// ── FLASHCARDS melhorados ──
 function gerarFlashcardsLocal(text) {
-  const scored = scoreSentences(text);
-  const top = scored.sort((a,b)=>b.score-a.score).slice(0,5);
-  const keywords = extractKeywords(text, 15);
+  const scored = scoreSentences(text).sort((a,b)=>b.score-a.score);
+  const defs = extractDefinitions(text);
+  const facts = extractFacts(text);
+  const keywords = extractKeywords(text, 20);
   const cards = [];
-  top.forEach((s, i) => {
+
+  // Cards a partir de definições (mais ricos)
+  defs.slice(0,3).forEach(def => {
+    const kw = keywords.find(k => def.toLowerCase().includes(k)) || keywords[0];
+    cards.push({
+      frente: `Defina ou explique: "${kw.charAt(0).toUpperCase()+kw.slice(1)}"`,
+      verso: def
+    });
+  });
+
+  // Cards de fatos/datas
+  facts.slice(0,2).forEach(fact => {
+    const kw = keywords.find(k => fact.toLowerCase().includes(k)) || keywords[0];
+    cards.push({
+      frente: `Qual dado/fato o texto apresenta sobre "${kw}"?`,
+      verso: fact
+    });
+  });
+
+  // Cards de lacuna nas frases mais relevantes
+  scored.slice(0, Math.max(0, 5 - cards.length)).forEach((s, i) => {
     const kw = keywords[i] || keywords[0];
-    // Cria pergunta lacunando palavra-chave
-    const pergunta = s.text.replace(new RegExp(`\\b${kw}\\w*\\b`, 'gi'), '______');
-    if (pergunta !== s.text) {
-      cards.push({ frente: `Complete: "${pergunta}"`, verso: s.text });
+    const lacuna = s.text.replace(new RegExp(`\\b${kw}\\w*\\b`, 'gi'), '______');
+    if (lacuna !== s.text) {
+      cards.push({ frente: `Complete: "${lacuna}"`, verso: s.text });
     } else {
       cards.push({ frente: `O que o texto afirma sobre "${kw}"?`, verso: s.text });
     }
   });
-  return cards;
+
+  return cards.slice(0, 5);
 }
 
-// Gera questões de múltipla escolha a partir do texto
+// ── QUESTÕES MELHORADAS — 5 tipos diferentes ──
 function gerarQuestoesLocal(text, n=5) {
-  const scored = scoreSentences(text);
-  const top = scored.sort((a,b)=>b.score-a.score).slice(0, n*2);
-  const keywords = extractKeywords(text, 20);
+  const scored = scoreSentences(text).sort((a,b)=>b.score-a.score);
+  const defs = extractDefinitions(text);
+  const facts = extractFacts(text);
+  const keywords = extractKeywords(text, 25);
   const questoes = [];
+  const letras = ['A)','B)','C)','D)','E)'];
 
-  for (let i = 0; i < Math.min(n, top.length); i++) {
-    const s = top[i];
-    const kw = keywords[i] || keywords[0];
+  function embaralhar(correta, pool, n=4) {
+    const dist = pool.filter(k=>k!==correta).slice(0,n);
+    while (dist.length < n) dist.push(`nenhuma das anteriores`);
+    const alts = [correta, ...dist].sort(()=>Math.random()-.5);
+    return { alts, idx: alts.indexOf(correta) };
+  }
 
-    // Distratores: outras palavras-chave do texto
-    const distratores = keywords.filter(k=>k!==kw).slice(0,4);
-    while (distratores.length < 4) distratores.push(`opção ${distratores.length+1}`);
-
-    // Alternativas embaralhadas
-    const correta = kw;
-    const alts = [correta, ...distratores.slice(0,4)].sort(()=>Math.random()-.5);
-    const idxCorreta = alts.indexOf(correta);
-    const letras = ['A)','B)','C)','D)','E)'];
-
-    // Enuncia a questão com lacuna
-    const enunciado = s.text.replace(new RegExp(`\\b${kw}\\w*\\b`,'gi'), '______');
-
+  // Tipo 1: Questão de definição (a partir de frases com verbos de definição)
+  defs.slice(0,2).forEach(def => {
+    const kw = keywords.find(k => def.toLowerCase().includes(k)) || keywords[0];
+    const { alts, idx } = embaralhar(kw, keywords.filter(k=>k!==kw));
     questoes.push({
       id: Date.now()+Math.random(),
-      text: enunciado !== s.text
-        ? `Complete a afirmação: "${enunciado}"`
-        : `Qual conceito está relacionado com a seguinte afirmação? "${s.text.substring(0,120)}..."`,
-      options: alts.map((a,j)=>`${letras[j]} ${a}`),
-      correct: idxCorreta,
-      justification: `A resposta correta é "${correta}". Conforme o texto: ${s.text}`,
-      subject: 'Processamento Local'
+      text: `Segundo o texto, qual conceito está corretamente definido pela seguinte afirmação: "${def.substring(0,200)}"?`,
+      options: alts.map((a,j)=>`${letras[j]} ${a.charAt(0).toUpperCase()+a.slice(1)}`),
+      correct: idx,
+      justification: `A alternativa correta é "${kw}". O texto afirma: "${def}"`,
+      subject: 'Definição'
+    });
+  });
+
+  // Tipo 2: Questão de fato/dado
+  facts.slice(0,1).forEach(fact => {
+    const kw = keywords.find(k => fact.toLowerCase().includes(k)) || keywords[0];
+    // Extrai um número/data do fato para usar como alternativa correta
+    const numero = fact.match(/\b(\d{4}|\d+[%º°])\b/)?.[0];
+    if (numero) {
+      const distNums = ['1800','1900','1950','2000','1850'].filter(n=>n!==numero);
+      const { alts, idx } = embaralhar(numero, distNums);
+      questoes.push({
+        id: Date.now()+Math.random(),
+        text: `De acordo com o texto, qual é a data/dado correto relacionado a "${kw}"?`,
+        options: alts.map((a,j)=>`${letras[j]} ${a}`),
+        correct: idx,
+        justification: `A resposta é ${numero}. Conforme o texto: "${fact}"`,
+        subject: 'Dado/Fato'
+      });
+    } else {
+      const { alts, idx } = embaralhar(kw, keywords.filter(k=>k!==kw));
+      questoes.push({
+        id: Date.now()+Math.random(),
+        text: `Qual conceito o texto associa ao seguinte fato: "${fact.substring(0,180)}"?`,
+        options: alts.map((a,j)=>`${letras[j]} ${a.charAt(0).toUpperCase()+a.slice(1)}`),
+        correct: idx,
+        justification: `A resposta correta é "${kw}". Conforme o texto: "${fact}"`,
+        subject: 'Dado/Fato'
+      });
+    }
+  });
+
+  // Tipo 3: Questão de compreensão (frase com lacuna de keyword importante)
+  scored.slice(0, n).forEach(s => {
+    if (questoes.length >= n) return;
+    // Escolhe keyword que aparece NA frase
+    const kwNaFrase = keywords.find(k => s.text.toLowerCase().includes(k));
+    if (!kwNaFrase) return;
+    const lacuna = s.text.replace(new RegExp(`\\b${kwNaFrase}\\w*\\b`,'gi'), '______');
+    if (lacuna === s.text) return; // keyword não estava na frase
+    const { alts, idx } = embaralhar(kwNaFrase, keywords.filter(k=>k!==kwNaFrase));
+    questoes.push({
+      id: Date.now()+Math.random(),
+      text: `Complete corretamente a afirmação do texto: "${lacuna.substring(0,220)}"`,
+      options: alts.map((a,j)=>`${letras[j]} ${a.charAt(0).toUpperCase()+a.slice(1)}`),
+      correct: idx,
+      justification: `A alternativa correta é "${kwNaFrase}". Trecho original: "${s.text}"`,
+      subject: 'Compreensão'
+    });
+  });
+
+  // Tipo 4: Questão de relação entre conceitos
+  if (questoes.length < n && keywords.length >= 6) {
+    const k1 = keywords[0], k2 = keywords[1];
+    const sentRelacionada = scored.find(s => s.text.toLowerCase().includes(k1) && s.text.toLowerCase().includes(k2));
+    if (sentRelacionada) {
+      const { alts, idx } = embaralhar(k2, keywords.filter(k=>k!==k1&&k!==k2));
+      questoes.push({
+        id: Date.now()+Math.random(),
+        text: `Segundo o texto, qual conceito está diretamente relacionado a "${k1}"?`,
+        options: alts.map((a,j)=>`${letras[j]} ${a.charAt(0).toUpperCase()+a.slice(1)}`),
+        correct: idx,
+        justification: `O texto relaciona "${k1}" a "${k2}": "${sentRelacionada.text}"`,
+        subject: 'Relação de conceitos'
+      });
+    }
+  }
+
+  // Tipo 5: Questão de identificação de afirmação correta
+  if (questoes.length < n) {
+    const frases = scored.slice(0,5).map(s=>s.text.substring(0,150));
+    if (frases.length >= 4) {
+      const correta = frases[0];
+      // Distratores: frases levemente modificadas (substituindo keywords)
+      const dist = frases.slice(1,4).map(f => {
+        const kw = keywords.find(k=>f.toLowerCase().includes(k));
+        const sub = keywords.find(k=>k!==kw);
+        return kw && sub ? f.replace(new RegExp(`\\b${kw}\\b`,'gi'), sub) : f;
+      });
+      const { alts, idx } = embaralhar(correta, dist);
+      questoes.push({
+        id: Date.now()+Math.random(),
+        text: `Qual das alternativas apresenta uma afirmação CORRETA de acordo com o texto?`,
+        options: alts.map((a,j)=>`${letras[j]} ${a.substring(0,120)}`),
+        correct: idx,
+        justification: `A afirmação correta é: "${correta}"`,
+        subject: 'Identificação'
+      });
+    }
+  }
+
+  // Preenche com questões de fallback se necessário
+  while (questoes.length < n && scored.length > questoes.length) {
+    const s = scored[questoes.length];
+    const kw = keywords.find(k => s.text.toLowerCase().includes(k)) || keywords[questoes.length % keywords.length];
+    const { alts, idx } = embaralhar(kw, keywords.filter(k=>k!==kw));
+    questoes.push({
+      id: Date.now()+Math.random(),
+      text: `Qual conceito o texto aborda na seguinte passagem: "${s.text.substring(0,180)}"?`,
+      options: alts.map((a,j)=>`${letras[j]} ${a.charAt(0).toUpperCase()+a.slice(1)}`),
+      correct: idx,
+      justification: `O conceito abordado é "${kw}". Trecho: "${s.text}"`,
+      subject: 'Compreensão'
     });
   }
-  return questoes;
+
+  return questoes.slice(0, n);
 }
 
-// Gera dica de estudo baseada no conteúdo
+// Gera dica de estudo
 function gerarDica(text) {
   const keywords = extractKeywords(text, 5);
+  const defs = extractDefinitions(text);
   const dicas = [
-    `Foque nos conceitos: ${keywords.slice(0,3).join(', ')}. Crie associações entre eles.`,
-    `Revise especialmente os termos: ${keywords.join(', ')}. Use os flashcards gerados!`,
-    `Os pontos centrais deste conteúdo giram em torno de: ${keywords.slice(0,3).join(', ')}. Pratique com o simulado.`,
-    `Para fixar melhor: releia as partes sobre ${keywords[0]} e ${keywords[1]}, depois faça o simulado.`
+    `Foque nos conceitos centrais: ${keywords.slice(0,3).join(', ')}. Tente explicar cada um com suas próprias palavras.`,
+    `Revise os termos: ${keywords.join(', ')}. Use os flashcards gerados para testar sua memória!`,
+    `Os pontos centrais giram em torno de: ${keywords.slice(0,3).join(', ')}. Faça o simulado para testar sua compreensão.`,
+    defs.length ? `Atenção especial para as definições identificadas. Entender "${keywords[0]}" é fundamental para este conteúdo.` : `Releia o texto focando nos termos: ${keywords.slice(0,3).join(', ')}, depois refaça o simulado.`
   ];
   return dicas[Math.floor(Math.random()*dicas.length)];
 }
 
-// Chat local simples (busca sentenças relevantes)
+// Chat local
 function chatLocal(pergunta, contexto) {
   if (!contexto) return 'Cole um texto na caixa acima para eu poder responder sobre ele!';
   const tokens = tokenize(pergunta);
   const scored = scoreSentences(contexto);
   const relevantes = scored.map(s => {
     const match = tokens.filter(t => s.text.toLowerCase().includes(t)).length;
-    return { ...s, match };
+    const kwMatch = tokens.filter(t => s.tokens.includes(t)).length;
+    return { ...s, match: match + kwMatch*2 };
   }).filter(s=>s.match>0).sort((a,b)=>b.match-a.match).slice(0,3);
-  if (!relevantes.length) return `Não encontrei informações sobre "${pergunta}" no texto. Tente reformular a pergunta ou verifique se o conteúdo foi colado corretamente.`;
-  return `Com base no texto:\n\n${relevantes.map(s=>`• ${s.text}`).join('\n\n')}`;
+  if (!relevantes.length) return `Não encontrei informações sobre "${pergunta}" no texto. Tente usar termos presentes no conteúdo.`;
+  return `📖 Com base no texto:\n\n${relevantes.map(s=>`• ${s.text}`).join('\n\n')}`;
 }
 
 // ── Extrai texto de arquivo carregado ──
