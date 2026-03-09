@@ -1326,7 +1326,7 @@ html, body {
         <div style="display:flex;gap:10px;align-items:center">
           <h2 style="font-size:15px;font-weight:600;">Resumos Inteligentes</h2>
           <div class="topbar-spacer"></div>
-          <button class="btn btn-primary btn-sm" id="summarize-btn" onclick="summarizeText()">✨ Resumir com IA</button>
+          <button class="btn btn-primary btn-sm" id="summarize-btn" onclick="summarizeText()">✨ Resumir</button>
         </div>
         <div class="card">
           <div class="card-title">📄 Cole ou Escreva o Conteúdo</div>
@@ -2151,15 +2151,17 @@ async function showScore() {
     </div>`;
   document.getElementById('quiz-setup').style.display='block';
 
-  // Busca feedback da IA
+  // Feedback local pós-simulado
   if (erradas.length > 0) {
     const fbArea = document.getElementById('ai-feedback-area');
-    fbArea.innerHTML = '<div style="color:var(--text3);font-size:13px">🧠 Gerando feedback personalizado...</div>';
-    try {
-      const erradasTexto = erradas.map(q=>`- ${q.text} (tema: ${q.subject||'geral'})`).join('\n');
-      const feedback = await callAI([{role:'user', content:`O estudante errou estas questões num simulado (nível superior):\n${erradasTexto}\n\nDê um feedback de 3-4 linhas: o que revisar, como estudar melhor, quais pontos focar. Seja encorajador e direto.`}], '', 400);
-      fbArea.innerHTML = `<div style="background:var(--accent)11;border:1px solid var(--accent)33;border-radius:10px;padding:12px;font-size:13px;line-height:1.6;color:var(--text2)"><strong>🤖 Feedback da IA:</strong><br>${feedback}</div>`;
-    } catch(e){ fbArea.innerHTML=''; }
+    const temas = [...new Set(erradas.map(q=>q.subject||'geral'))].join(', ');
+    const frases = [
+      `Você errou ${erradas.length} questão(ões) sobre: ${temas}. Revise esses tópicos e refaça o simulado!`,
+      `Foque em revisar: ${temas}. Leia novamente o material e use os flashcards para fixar.`,
+      `As questões erradas envolvem ${temas}. Tente anotar os conceitos principais no caderno e refaça.`
+    ];
+    const feedback = frases[Math.floor(Math.random()*frases.length)];
+    fbArea.innerHTML = `<div style="background:var(--accent)11;border:1px solid var(--accent)33;border-radius:10px;padding:12px;font-size:13px;line-height:1.6;color:var(--text2)"><strong>📋 Feedback:</strong><br>${feedback}</div>`;
   }
 }
 
@@ -2506,21 +2508,177 @@ function checkAlarms(now) {
 }
 
 // ══════════════════════════════════════════════
-// IA — FUNÇÃO CENTRAL (corrige CORS via proxy)
+// PROCESSAMENTO LOCAL — SEM IA EXTERNA
 // ══════════════════════════════════════════════
-const GEMINI_KEY = 'AIzaSyCl-4HdTnuYfnKGJxwMr12W90n3OrKcsIc';
-const PROXY_URL = 'https://proxy-ia.xand391.workers.dev';
 
-async function callAI(messages, systemPrompt='', maxTokens=1500) {
-  let fullPrompt = '';
-  if (systemPrompt) fullPrompt = systemPrompt + '\n\n';
-  fullPrompt += messages.map(m => (m.role==='user'?'Usuário: ':'Assistente: ') + m.content).join('\n');
-  const url = PROXY_URL + '/v1beta/models/gemini-2.0-flash:generateContent?key=' + GEMINI_KEY;
-  const body = { contents: [{ parts: [{ text: fullPrompt }] }], generationConfig: { maxOutputTokens: maxTokens, temperature: 0.7 } };
-  const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  if (!resp.ok) throw new Error('HTTP ' + resp.status);
-  const data = await resp.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+// Palavras irrelevantes (stopwords PT-BR)
+const STOPWORDS = new Set(['a','o','e','é','de','do','da','dos','das','em','no','na','nos','nas','um','uma','uns','umas','para','por','com','que','se','não','mas','mais','como','ou','ao','aos','às','pelo','pela','pelos','pelas','seu','sua','seus','suas','este','esta','estes','estas','esse','essa','esses','essas','ele','ela','eles','elas','foi','são','ser','ter','tem','tinha','que','isso','isto','aqui','já','também','quando','onde','qual','quais','seus','sobre','entre','até','após','antes','durante','então','assim','cada','todo','toda','todos','todas','outro','outra','outros','outras','mesmo','muito','pouco','bem','assim','ainda','só','apenas','porém','contudo','entretanto','portanto','logo','pois','porque','embora','apenas']);
+
+// Tokeniza e pondera palavras
+function tokenize(text) {
+  return text.toLowerCase()
+    .replace(/[^a-záéíóúàâêôãõüç\s]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 3 && !STOPWORDS.has(w));
+}
+
+// TF: frequência de termos
+function termFrequency(tokens) {
+  const freq = {};
+  tokens.forEach(t => freq[t] = (freq[t]||0) + 1);
+  return freq;
+}
+
+// Pontua sentenças por relevância
+function scoreSentences(text) {
+  const sentences = text.match(/[^.!?]+[.!?]+/g) || text.split('\n').filter(s=>s.trim().length>20);
+  const allTokens = tokenize(text);
+  const freq = termFrequency(allTokens);
+  return sentences.map(s => {
+    const tokens = tokenize(s);
+    const score = tokens.reduce((acc, t) => acc + (freq[t]||0), 0) / (tokens.length||1);
+    return { text: s.trim(), score, tokens };
+  }).filter(s => s.text.length > 20);
+}
+
+// Extrai palavras-chave principais
+function extractKeywords(text, n=10) {
+  const tokens = tokenize(text);
+  const freq = termFrequency(tokens);
+  return Object.entries(freq)
+    .sort((a,b) => b[1]-a[1])
+    .slice(0, n)
+    .map(([w]) => w);
+}
+
+// Detecta tema principal (frase mais representativa)
+function detectTema(text) {
+  const scored = scoreSentences(text);
+  if (!scored.length) return 'Conteúdo estudado';
+  return scored.sort((a,b)=>b.score-a.score)[0].text.substring(0,80);
+}
+
+// Gera resumo em tópicos
+function gerarResumoBullet(text) {
+  const scored = scoreSentences(text);
+  const top = scored.sort((a,b)=>b.score-a.score).slice(0,8);
+  const icons = ['📌','🔑','📖','💡','🎯','📝','⚡','🔍'];
+  return top.map((s,i) => `${icons[i%icons.length]} ${s.text}`).join('\n\n');
+}
+
+// Gera resumo Cornell
+function gerarResumoCornell(text) {
+  const scored = scoreSentences(text);
+  const top = scored.sort((a,b)=>b.score-a.score);
+  const keywords = extractKeywords(text, 8);
+  const notas = top.slice(0,5).map(s=>`• ${s.text}`).join('\n');
+  const sumario = top.slice(0,2).map(s=>s.text).join(' ');
+  return `═══ NOTAS ═══\n${notas}\n\n═══ PALAVRAS-CHAVE ═══\n${keywords.map(k=>`• ${k}`).join('\n')}\n\n═══ SUMÁRIO ═══\n${sumario}`;
+}
+
+// Gera resumo pirâmide invertida
+function gerarResumoPiramide(text) {
+  const scored = scoreSentences(text);
+  const top = scored.sort((a,b)=>b.score-a.score);
+  return `🔺 CONCEITO CENTRAL\n${top[0]?.text||''}\n\n🔸 INFORMAÇÕES PRINCIPAIS\n${top.slice(1,4).map(s=>`• ${s.text}`).join('\n')}\n\n🔹 CONTEXTO E DETALHES\n${top.slice(4,7).map(s=>`• ${s.text}`).join('\n')}`;
+}
+
+// Gera mapa mental textual
+function gerarMapaMental(text) {
+  const keywords = extractKeywords(text, 12);
+  const scored = scoreSentences(text);
+  const tema = scored.sort((a,b)=>b.score-a.score)[0]?.text.substring(0,50)||'Tema Principal';
+  const ramos = keywords.slice(0,5);
+  let mapa = `🗺️ ${tema.toUpperCase()}\n`;
+  ramos.forEach((r,i) => {
+    mapa += `\n  ├─ ${r.charAt(0).toUpperCase()+r.slice(1)}\n`;
+    keywords.slice(5+i*1, 6+i*1).forEach(sub => {
+      mapa += `  │   └─ ${sub}\n`;
+    });
+  });
+  return mapa;
+}
+
+// Gera flashcards automaticamente
+function gerarFlashcardsLocal(text) {
+  const scored = scoreSentences(text);
+  const top = scored.sort((a,b)=>b.score-a.score).slice(0,5);
+  const keywords = extractKeywords(text, 15);
+  const cards = [];
+  top.forEach((s, i) => {
+    const kw = keywords[i] || keywords[0];
+    // Cria pergunta lacunando palavra-chave
+    const pergunta = s.text.replace(new RegExp(`\\b${kw}\\w*\\b`, 'gi'), '______');
+    if (pergunta !== s.text) {
+      cards.push({ frente: `Complete: "${pergunta}"`, verso: s.text });
+    } else {
+      cards.push({ frente: `O que o texto afirma sobre "${kw}"?`, verso: s.text });
+    }
+  });
+  return cards;
+}
+
+// Gera questões de múltipla escolha a partir do texto
+function gerarQuestoesLocal(text, n=5) {
+  const scored = scoreSentences(text);
+  const top = scored.sort((a,b)=>b.score-a.score).slice(0, n*2);
+  const keywords = extractKeywords(text, 20);
+  const questoes = [];
+
+  for (let i = 0; i < Math.min(n, top.length); i++) {
+    const s = top[i];
+    const kw = keywords[i] || keywords[0];
+
+    // Distratores: outras palavras-chave do texto
+    const distratores = keywords.filter(k=>k!==kw).slice(0,4);
+    while (distratores.length < 4) distratores.push(`opção ${distratores.length+1}`);
+
+    // Alternativas embaralhadas
+    const correta = kw;
+    const alts = [correta, ...distratores.slice(0,4)].sort(()=>Math.random()-.5);
+    const idxCorreta = alts.indexOf(correta);
+    const letras = ['A)','B)','C)','D)','E)'];
+
+    // Enuncia a questão com lacuna
+    const enunciado = s.text.replace(new RegExp(`\\b${kw}\\w*\\b`,'gi'), '______');
+
+    questoes.push({
+      id: Date.now()+Math.random(),
+      text: enunciado !== s.text
+        ? `Complete a afirmação: "${enunciado}"`
+        : `Qual conceito está relacionado com a seguinte afirmação? "${s.text.substring(0,120)}..."`,
+      options: alts.map((a,j)=>`${letras[j]} ${a}`),
+      correct: idxCorreta,
+      justification: `A resposta correta é "${correta}". Conforme o texto: ${s.text}`,
+      subject: 'Processamento Local'
+    });
+  }
+  return questoes;
+}
+
+// Gera dica de estudo baseada no conteúdo
+function gerarDica(text) {
+  const keywords = extractKeywords(text, 5);
+  const dicas = [
+    `Foque nos conceitos: ${keywords.slice(0,3).join(', ')}. Crie associações entre eles.`,
+    `Revise especialmente os termos: ${keywords.join(', ')}. Use os flashcards gerados!`,
+    `Os pontos centrais deste conteúdo giram em torno de: ${keywords.slice(0,3).join(', ')}. Pratique com o simulado.`,
+    `Para fixar melhor: releia as partes sobre ${keywords[0]} e ${keywords[1]}, depois faça o simulado.`
+  ];
+  return dicas[Math.floor(Math.random()*dicas.length)];
+}
+
+// Chat local simples (busca sentenças relevantes)
+function chatLocal(pergunta, contexto) {
+  if (!contexto) return 'Cole um texto na caixa acima para eu poder responder sobre ele!';
+  const tokens = tokenize(pergunta);
+  const scored = scoreSentences(contexto);
+  const relevantes = scored.map(s => {
+    const match = tokens.filter(t => s.text.toLowerCase().includes(t)).length;
+    return { ...s, match };
+  }).filter(s=>s.match>0).sort((a,b)=>b.match-a.match).slice(0,3);
+  if (!relevantes.length) return `Não encontrei informações sobre "${pergunta}" no texto. Tente reformular a pergunta ou verifique se o conteúdo foi colado corretamente.`;
+  return `Com base no texto:\n\n${relevantes.map(s=>`• ${s.text}`).join('\n\n')}`;
 }
 
 // ── Extrai texto de arquivo carregado ──
@@ -2569,98 +2727,43 @@ async function analyzeFileWithAI(fileIdx) {
   await autoGenerateFromText(text, file.name);
 }
 
-async function autoGenerateFromText(text, fileName='') {
-  const container = document.getElementById('ai-auto-results');
-  if (container) container.style.display = 'block';
+function autoGenerateFromText(text, fileName='') {
   showAILoading(true);
+  setTimeout(() => {
+    try {
+      const resumo = gerarResumoBullet(text);
+      document.getElementById('summary-output').textContent = resumo;
+      document.getElementById('summary-output-card').style.display = 'block';
 
-  try {
-    const system = `Você é um assistente educacional especializado em nível SUPERIOR universitário. Seja técnico, preciso e profissional.`;
-
-    const prompt = `Analise este conteúdo "${fileName}" e retorne EXATAMENTE este JSON (sem markdown, sem explicações):
-{
-  "tema": "tema principal em 1 linha",
-  "resumo": "resumo em tópicos com emojis, 5-8 pontos",
-  "flashcards": [
-    {"frente": "pergunta técnica", "verso": "resposta completa"},
-    {"frente": "pergunta técnica", "verso": "resposta completa"},
-    {"frente": "pergunta técnica", "verso": "resposta completa"},
-    {"frente": "pergunta técnica", "verso": "resposta completa"},
-    {"frente": "pergunta técnica", "verso": "resposta completa"}
-  ],
-  "questoes": [
-    {
-      "enunciado": "questão de múltipla escolha nível superior",
-      "alternativas": ["A) texto", "B) texto", "C) texto", "D) texto", "E) texto"],
-      "correta": 0,
-      "justificativa": "explicação detalhada da resposta correta"
-    },
-    {
-      "enunciado": "questão de múltipla escolha nível superior",
-      "alternativas": ["A) texto", "B) texto", "C) texto", "D) texto", "E) texto"],
-      "correta": 1,
-      "justificativa": "explicação detalhada da resposta correta"
-    },
-    {
-      "enunciado": "questão de múltipla escolha nível superior",
-      "alternativas": ["A) texto", "B) texto", "C) texto", "D) texto", "E) texto"],
-      "correta": 2,
-      "justificativa": "explicação detalhada da resposta correta"
-    }
-  ],
-  "dica": "dica de estudo personalizada para este conteúdo"
-}
-
-TEXTO:
-${text.substring(0,3500)}`;
-
-    const raw = await callAI([{role:'user',content:prompt}], system, 2000);
-    const clean = raw.replace(/```json|```/g,'').trim();
-    const result = JSON.parse(clean);
-
-    // Preenche resumo
-    document.getElementById('summary-input').value = text;
-    document.getElementById('summary-output').textContent = result.resumo;
-    document.getElementById('summary-output-card').style.display = 'block';
-
-    // Salva flashcards
-    if (result.flashcards?.length) {
-      result.flashcards.forEach(fc => {
-        state.flashcards.push({id:Date.now()+Math.random(), front:fc.frente, back:fc.verso, subject:result.tema||'IA', difficulty:null});
+      // Flashcards
+      const cards = gerarFlashcardsLocal(text);
+      cards.forEach(fc => {
+        state.flashcards.push({id:Date.now()+Math.random(), front:fc.frente, back:fc.verso, subject:fileName||'Local', difficulty:null});
       });
+
+      // Questões
+      const questoes = gerarQuestoesLocal(text, 3);
+      questoes.forEach(q => state.questions.push(q));
+
       saveState(); updateStats();
+
+      // Dica
+      const dica = gerarDica(text);
+      const tema = detectTema(text).substring(0,60);
+      showAIDica(dica, tema);
+
+      toast(`✅ Gerou: resumo + ${cards.length} flashcards + ${questoes.length} questões!`,'success','🧠');
+    } catch(e) {
+      console.error('Erro local:', e);
+      toast('Erro ao processar: ' + e.message,'error','⚠️');
     }
-
-    // Salva questões
-    if (result.questoes?.length) {
-      result.questoes.forEach(q => {
-        state.questions.push({
-          id:Date.now()+Math.random(),
-          text:q.enunciado,
-          options:q.alternativas,
-          correct:q.correta,
-          justification:q.justificativa,
-          subject:result.tema||'IA'
-        });
-      });
-      saveState(); updateStats();
-    }
-
-    // Mostra dica
-    if (result.dica) showAIDica(result.dica, result.tema);
-
-    toast(`✅ IA gerou: resumo + ${result.flashcards?.length||0} flashcards + ${result.questoes?.length||0} questões!`,'success','🧠');
-
-  } catch(e) {
-    console.error('AI error:', e);
-    toast('Erro na IA: ' + e.message,'error','⚠️');
-  }
-  showAILoading(false);
+    showAILoading(false);
+  }, 150);
 }
 
 function showAILoading(on) {
   const btn = document.getElementById('summarize-btn');
-  if (btn) { btn.textContent = on ? '⏳ Processando...' : '✨ Resumir com IA'; btn.disabled = on; }
+  if (btn) { btn.textContent = on ? '⏳ Processando...' : '✨ Resumir'; btn.disabled = on; }
 }
 
 function showAIDica(dica, tema) {
@@ -2677,50 +2780,41 @@ function showAIDica(dica, tema) {
 }
 
 // ══════════════════════════════════════════════
-// RESUMOS / IA (corrigido)
+// RESUMOS — PROCESSAMENTO LOCAL
 // ══════════════════════════════════════════════
-async function summarizeText() {
-  const text=document.getElementById('summary-input').value.trim();
-  if(!text){toast('Cole um texto primeiro!','error','⚠️');return;}
-  const style=document.getElementById('summary-style').value;
-  const btn=document.getElementById('summarize-btn');
-  btn.textContent='⏳ Resumindo...'; btn.disabled=true;
+function summarizeText() {
+  const text = document.getElementById('summary-input').value.trim();
+  if (!text) { toast('Cole um texto primeiro!','error','⚠️'); return; }
+  const style = document.getElementById('summary-style').value;
+  const btn = document.getElementById('summarize-btn');
+  btn.textContent = '⏳ Processando...'; btn.disabled = true;
 
-  const stylePrompts={
-    bullet:'Crie um resumo em tópicos com bullet points em português. Use ícones nos tópicos. Nível universitário.',
-    cornell:'Método Cornell: 1) NOTAS (pontos principais) 2) PALAVRAS-CHAVE 3) SUMÁRIO. Nível universitário.',
-    piramide:'Pirâmide Invertida: conceito mais importante primeiro, depois detalhes, depois contexto. Nível universitário.',
-    mapa:'Mapa mental textual hierárquico: tema central → ramos → sub-ramos. Em português.',
-    flashcards:'Gere 5 flashcards no formato:\nFRENTE: [pergunta técnica nível superior]\nVERSO: [resposta completa]\n\nUse este formato exato.'
-  };
+  setTimeout(() => {
+    try {
+      let result = '';
+      if (style === 'bullet')      result = gerarResumoBullet(text);
+      else if (style === 'cornell') result = gerarResumoCornell(text);
+      else if (style === 'piramide') result = gerarResumoPiramide(text);
+      else if (style === 'mapa')    result = gerarMapaMental(text);
+      else if (style === 'flashcards') {
+        const cards = gerarFlashcardsLocal(text);
+        cards.forEach(fc => {
+          state.flashcards.push({id:Date.now()+Math.random(), front:fc.frente, back:fc.verso, subject:'Local', difficulty:null});
+        });
+        saveState(); updateStats();
+        result = cards.map((fc,i)=>`FRENTE: ${fc.frente}\nVERSO: ${fc.verso}`).join('\n\n──────────\n\n');
+        toast(`${cards.length} flashcards gerados e salvos!`,'success','🃏');
+      }
 
-  try {
-    const result = await callAI(
-      [{role:'user', content:`${stylePrompts[style]}\n\nTEXTO:\n${text.substring(0,3000)}`}],
-      'Você é um tutor universitário especializado. Seja técnico e preciso.',
-      1200
-    );
-    document.getElementById('summary-output').textContent = result;
-    document.getElementById('summary-output-card').style.display = 'block';
-
-    if(style==='flashcards') {
-      const lines=result.split('\n');
-      let front='';
-      lines.forEach(l=>{
-        if(l.startsWith('FRENTE:')) front=l.replace('FRENTE:','').trim();
-        if(l.startsWith('VERSO:')&&front){
-          state.flashcards.push({id:Date.now()+Math.random(), front, back:l.replace('VERSO:','').trim(), subject:'IA', difficulty:null});
-          front='';
-        }
-      });
-      saveState(); updateStats();
-      toast('Flashcards gerados e salvos!','success','🃏');
+      document.getElementById('summary-output').textContent = result;
+      document.getElementById('summary-output-card').style.display = 'block';
+      if (style !== 'flashcards') toast('Resumo gerado!','success','✅');
+    } catch(e) {
+      document.getElementById('summary-output').textContent = '❌ Erro ao processar: ' + e.message;
+      document.getElementById('summary-output-card').style.display = 'block';
     }
-  } catch(e){
-    document.getElementById('summary-output').textContent='❌ Erro ao conectar com a IA: '+e.message;
-    document.getElementById('summary-output-card').style.display='block';
-  }
-  btn.textContent='✨ Resumir com IA'; btn.disabled=false;
+    btn.textContent = '✨ Resumir'; btn.disabled = false;
+  }, 100);
 }
 
 function exportSummary() {
@@ -2730,56 +2824,34 @@ function exportSummary() {
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='resumo.txt';a.click();
 }
 
-async function generateQuizFromText() {
+function generateQuizFromText() {
   const text = document.getElementById('summary-input').value.trim();
   if (!text) { toast('Cole um texto primeiro!','error','⚠️'); return; }
-  toast('🎯 Gerando simulado com IA...','info','🎯');
-  try {
-    const raw = await callAI([{role:'user', content:`Gere 5 questões de múltipla escolha de NÍVEL SUPERIOR sobre este conteúdo. Retorne SOMENTE JSON, sem markdown:
-[
-  {
-    "text": "enunciado da questão",
-    "options": ["A) texto","B) texto","C) texto","D) texto","E) texto"],
-    "correct": 0,
-    "justification": "explicação da resposta correta",
-    "subject": "tema"
-  }
-]
-
-CONTEÚDO:
-${text.substring(0,3000)}`}], '', 1500);
-    const clean = raw.replace(/```json|```/g,'').trim();
-    const questoes = JSON.parse(clean);
-    questoes.forEach(q => {
-      state.questions.push({id:Date.now()+Math.random(), ...q});
-    });
-    saveState(); updateStats();
-    toast(`✅ ${questoes.length} questões adicionadas ao simulado!`,'success','🎯');
-    navigate('quiz');
-  } catch(e){ toast('Erro ao gerar simulado: '+e.message,'error','⚠️'); }
+  toast('🎯 Gerando simulado...','info','🎯');
+  setTimeout(() => {
+    try {
+      const questoes = gerarQuestoesLocal(text, 5);
+      if (!questoes.length) { toast('Texto muito curto para gerar questões!','error','⚠️'); return; }
+      questoes.forEach(q => state.questions.push(q));
+      saveState(); updateStats();
+      toast(`✅ ${questoes.length} questões adicionadas ao simulado!`,'success','🎯');
+      navigate('quiz');
+    } catch(e) { toast('Erro ao gerar simulado: '+e.message,'error','⚠️'); }
+  }, 100);
 }
 
-// Chat
-const chatHistory=[];
-async function sendChat() {
+// Chat local
+function sendChat() {
   const input=document.getElementById('chat-input');
   const msg=input.value.trim();
   if(!msg) return;
   input.value='';
   const context=document.getElementById('summary-input').value.trim();
   addChatMsg('user',msg);
-  chatHistory.push({role:'user',content:msg});
-  addChatMsg('assistant','⏳ Pensando...');
-  try {
-    const ans = await callAI(
-      chatHistory,
-      context ? `Você é um tutor universitário. Responda com base neste conteúdo:\n${context.substring(0,2000)}` : 'Você é um tutor universitário especializado.',
-      800
-    );
-    document.getElementById('chat-messages').lastElementChild.remove();
-    addChatMsg('assistant',ans);
-    chatHistory.push({role:'assistant',content:ans});
-  } catch(e){document.getElementById('chat-messages').lastElementChild.textContent='❌ Erro de conexão: '+e.message;}
+  setTimeout(() => {
+    const ans = chatLocal(msg, context);
+    addChatMsg('assistant', ans);
+  }, 80);
 }
 
 function addChatMsg(role,text) {
@@ -3003,4 +3075,3 @@ updateOnlineStatus();
 </script>
 </body>
 </html>
-
